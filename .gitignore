@@ -51,5 +51,8 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
+# Meson build directory
+build/
+
 # debug information files
 *.dwo
