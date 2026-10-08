@@ -50,5 +50,5 @@ executable('elephantdpdk',
     sources,
     include_directories: inc,
     dependencies: [dpdk_dep, m_dep],
-    c_args: extra_flags,
+    c_args: ['-DALLOW_EXPERIMENTAL_API'] + extra_flags,
     install: false)

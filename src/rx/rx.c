@@ -88,7 +88,6 @@ synth_generate_burst(struct elephant_rx_ctx *ctx, struct rte_mbuf **pkts)
 
 		memset(eth, 0, sizeof(*eth));
 		eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
-		eth->s_addr.addr_bytes[5] = (uint8_t)ctx->queue_id;
 
 		memset(ip, 0, sizeof(*ip));
 		ip->version_ihl = 0x45; /* IPv4, IHL = 5 (20 bytes) */

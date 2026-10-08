@@ -19,9 +19,18 @@
 #include <rte_mbuf.h>
 #include <rte_mbuf_dyn.h>
 
-/* Custom logtype, registered in main.c. */
+/*
+ * Custom logtype, registered in main.c via rte_log_register().
+ *
+ * RTE_LOG()'s expansion differs across DPDK versions: some pass the
+ * logtype token through as-is, others paste an "RTE_LOGTYPE_" prefix
+ * onto it. Define both spellings so RTE_LOG(INFO, EDPDK, ...) compiles
+ * on any version: the pasted token RTE_LOGTYPE_EDPDK macro-expands to
+ * edpdk_logtype after token pasting.
+ */
 extern int edpdk_logtype;
 #define EDPDK edpdk_logtype
+#define RTE_LOGTYPE_EDPDK edpdk_logtype
 
 #define ELEPHANT_BURST_MAX        32    /* max RX / ring burst size          */
 #define ELEPHANT_RING_SIZE        4096  /* per-worker ring depth (power of 2) */

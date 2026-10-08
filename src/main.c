@@ -32,6 +32,7 @@
 #include <rte_mbuf.h>
 #include <rte_mempool.h>
 #include <rte_ring.h>
+#include <rte_version.h>
 
 #include "app_ctx.h"
 #include "elephant_common.h"
@@ -41,6 +42,22 @@
 #include "worker/worker.h"
 
 int edpdk_logtype;
+
+/*
+ * DPDK 21.11 renamed the ethdev ETH_* constants to RTE_ETH_* (the old
+ * names lingered as deprecated aliases afterwards). Pick the right
+ * spelling at compile time so this builds from 20.11 through the
+ * latest release.
+ */
+#if RTE_VERSION < RTE_VERSION_NUM(21, 11, 0, 0)
+#define EDPDK_MQ_RX_RSS    ETH_MQ_RX_RSS
+#define EDPDK_RSS_OFFLOADS (ETH_RSS_IP | ETH_RSS_TCP | ETH_RSS_UDP)
+#define EDPDK_LINK_UP      ETH_LINK_UP
+#else
+#define EDPDK_MQ_RX_RSS    RTE_ETH_MQ_RX_RSS
+#define EDPDK_RSS_OFFLOADS (RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP | RTE_ETH_RSS_UDP)
+#define EDPDK_LINK_UP      RTE_ETH_LINK_UP
+#endif
 
 static void
 signal_handler(int signum)
@@ -170,7 +187,7 @@ port_init(uint16_t port, uint16_t n_rx_queues, struct rte_mempool *pool)
 
 	memset(&port_conf, 0, sizeof(port_conf));
 	if (n_rx_queues > 1) {
-		uint64_t rss_hf = ETH_RSS_IP | ETH_RSS_TCP | ETH_RSS_UDP;
+		uint64_t rss_hf = EDPDK_RSS_OFFLOADS;
 
 		rss_hf &= dev_info.flow_type_rss_offloads;
 		if (rss_hf == 0) {
@@ -178,7 +195,7 @@ port_init(uint16_t port, uint16_t n_rx_queues, struct rte_mempool *pool)
 				"port %u: no supported RSS offloads, "
 				"flows will hash to queue 0 only\n", port);
 		}
-		port_conf.rxmode.mq_mode = ETH_MQ_RSS;
+		port_conf.rxmode.mq_mode = EDPDK_MQ_RX_RSS;
 		port_conf.rx_adv_conf.rss_conf.rss_hf = rss_hf;
 	}
 
@@ -222,7 +239,7 @@ port_init(uint16_t port, uint16_t n_rx_queues, struct rte_mempool *pool)
 	rte_eth_link_get_nowait(port, &link);
 	RTE_LOG(INFO, EDPDK,
 		"port %u up: %s, speed %u Mbps, %u RX queue(s)\n",
-		port, link.link_status == ETH_LINK_UP ? "up" : "down",
+		port, link.link_status == EDPDK_LINK_UP ? "up" : "down",
 		link.link_speed, n_rx_queues);
 	return 0;
 }
@@ -296,8 +313,19 @@ main(int argc, char *argv[])
 	argc -= ret;
 	argv += ret;
 
-	edpdk_logtype = rte_log_register_type_and_pick_level("elephantdpdk",
-							      RTE_LOG_INFO);
+	/*
+	 * rte_log_register()/rte_log_set_level() are stable since DPDK
+	 * 17.11; rte_log_register_type_and_pick_level() is experimental
+	 * in several versions, so avoid it.
+	 */
+	edpdk_logtype = rte_log_register("elephantdpdk");
+	if (edpdk_logtype < 0) {
+		edpdk_logtype = RTE_LOGTYPE_USER1; /* static fallback */
+		RTE_LOG(WARNING, EDPDK,
+			"logtype registration failed; using USER1\n");
+	} else {
+		rte_log_set_level((uint32_t)edpdk_logtype, RTE_LOG_INFO);
+	}
 
 	/* Register the per-packet metadata dynfield (udata64 successor). */
 	if (elephant_dynfield_init() != 0)
@@ -350,12 +378,16 @@ main(int argc, char *argv[])
 	}
 
 	/* Dispatcher + worker contexts. */
-	disp = rte_zmalloc("disp", sizeof(*disp), RTE_CACHE_LINE_SIZE,
-			   rte_socket_id());
-	workers = rte_zmalloc("workers", sizeof(*workers) * cfg.n_workers,
-			       RTE_CACHE_LINE_SIZE, rte_socket_id());
-	rx_ctxs = rte_zmalloc("rx_ctxs", sizeof(*rx_ctxs) * cfg.n_rx_queues,
-			       RTE_CACHE_LINE_SIZE, rte_socket_id());
+	/* NOTE: plain rte_zmalloc() takes (type, size, align) only; the
+	 * NUMA-aware variant is rte_zmalloc_socket() with 4 parameters. */
+	disp = rte_zmalloc_socket("disp", sizeof(*disp),
+				  RTE_CACHE_LINE_SIZE, rte_socket_id());
+	workers = rte_zmalloc_socket("workers",
+				      sizeof(*workers) * cfg.n_workers,
+				      RTE_CACHE_LINE_SIZE, rte_socket_id());
+	rx_ctxs = rte_zmalloc_socket("rx_ctxs",
+				      sizeof(*rx_ctxs) * cfg.n_rx_queues,
+				      RTE_CACHE_LINE_SIZE, rte_socket_id());
 	if (disp == NULL || workers == NULL || rx_ctxs == NULL)
 		rte_exit(EXIT_FAILURE, "out of memory for contexts\n");
 

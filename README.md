@@ -80,7 +80,7 @@ src/
 
 ## 编译
 
-前置条件:已构建好的 DPDK(≥ 21.11 LTS,建议 22.11+)及其 `libdpdk.pc`,以及 meson + ninja。
+前置条件:已构建好的 DPDK(20.11 LTS ~ 最新,代码对 21.11 前后的 ethdev 常量命名 `ETH_*`/`RTE_ETH_*` 做了版本自适应)及其 `libdpdk.pc`,以及 meson + ninja。
 
 ```bash
 # 指向现有 DPDK build 目录(meson-uninstalled 下有 libdpdk.pc)
@@ -93,6 +93,8 @@ ninja -C build
 ```
 
 > 如果 pkg-config 找不到 libdpdk,可用 `pkg-config --variable=pcfilepath libdpdk` 确认路径;或直接 `PKG_CONFIG_PATH=<dpdk build>/meson-uninstalled`。
+>
+> 若编译时仍出现 API 不兼容报错,请用 `pkg-config --modversion libdpdk` 确认 DPDK 版本:本项目按 20.11+(即 `rte_` 前缀的结构体命名)~ 最新版本适配。
 
 ## 运行
 
