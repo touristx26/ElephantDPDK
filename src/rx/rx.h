@@ -25,6 +25,16 @@
 #include "nitrosketch/nitrosketch.h"
 #include "dispatcher/dispatcher.h"
 
+/* Direct-mapped table to avoid re-announcing the same elephant flow. */
+#define RX_ANNOUNCE_TABLE 256u
+
+struct elephant_rx_stats {
+	uint64_t packets;
+	uint64_t bytes;
+	uint64_t elephant_packets;
+	uint64_t elephant_flows;
+} __rte_cache_aligned;
+
 /*
  * Time-window mode: dual-sketch rotation.
  * Each RX lcore owns two sketches, [epoch & 1] is the current
@@ -48,7 +58,7 @@ struct elephant_rx_ctx {
 	struct nitrosketch sketch[2];  /* [0]=current, [1]=retired (rotated) */
 
 	uint64_t lcg;
-	uint64_t announced[256];
+	uint64_t announced[RX_ANNOUNCE_TABLE];
 
 	struct elephant_rx_stats stats;
 };
