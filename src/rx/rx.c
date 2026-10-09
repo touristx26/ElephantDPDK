@@ -259,18 +259,17 @@ rx_process_burst(struct elephant_rx_ctx *ctx,
 				ns_update(&ctx->sketch[cur_idx], h, m->pkt_len);
 				uint64_t cur_est = ns_estimate(&ctx->sketch[cur_idx], h);
 				uint64_t prev_est = ns_estimate(&ctx->sketch[prev_idx], h);
-				is_elephant =
-					(cur_est + prev_est) >= ctx->elephant_threshold;
+				uint64_t est = cur_est + prev_est;
+				is_elephant = est >= ctx->elephant_threshold;
 			} else {
 				ns_update(&ctx->sketch[cur_idx], h, m->pkt_len);
-				is_elephant =
-					ns_estimate(&ctx->sketch[cur_idx], h) >=
-					ctx->elephant_threshold;
-			}
+				uint64_t est = ns_estimate(&ctx->sketch[cur_idx], h);
+				is_elephant = est >= ctx->elephant_threshold;
 
-			if (is_elephant) {
-				elephant_pkts++;
-				rx_announce_elephant(ctx, h, est);
+				if (is_elephant) {
+					elephant_pkts++;
+					rx_announce_elephant(ctx, h, est);
+				}
 			}
 		} else {
 			/* Non-IP: spread by a per-packet hash, no flag. */
