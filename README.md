@@ -71,7 +71,8 @@ src/
 
 | 主题 | 实现 |
 |---|---|
-| 大象流判定 | 每包把 `pkt_len` 记入本 lcore 私有的 NitroSketch(4 行 × 1024 列,采样率 0.9^j 的 geometric-interarrival 采样),随后查询最小方差估计,`est >= threshold`(默认 1 MiB)即打标 |
+| 大象流判定 | 每包把 `pkt_len` 记入本 lcore 私有的 NitroSketch(4 行 × 1024 列,采样率 0.9^j 的 geometric-interarrival 采样),随后查询最小方差估计,`est >= threshold`(默认 1 MiB)即打标。可用 `-W` 升级为**双 sketch 滑动窗口**判定(见下文) |
+| **双 sketch 滑动窗口**(`-W`) | 每个 RX lcore 持有 2 个 sketch(共 8 行):当前窗口 `sketch[epoch&1]` 与上一窗口 `sketch[(epoch&1)^1]`。主 lcore 每 `stats_period_s` 秒广播一次 epoch 原子递增,各 RX lcore 在 burst 边界检测到变化后清零退役 sketch 并交换角色。每包对当前 sketch 记账后查询 `当前 est + 上一窗口 est`,超过 `-t` 阈值即打标。语义从"累计体积"变为"最近一个窗口内的体积"。低速率长流(如 keepalive)不再被误判,窗口过完自动衰减 |
 | 数据包标记 | 传统 `mbuf->udata64` 字段已在 DPDK 20.11 中被移除,故用 `rte_mbuf_dynfield` 注册等价的 64-bit 字段(EAL init 后、mempool 使用前注册):bit63 = elephant 标志,低 63 位 = flow hash。Worker 端只需一次位运算即可分流 |
 | 分发 | `dispatcher` 按 flow hash 高 32 位映射到 worker ring;先按 worker 在栈上分桶,再每 worker 一次 `rte_ring_enqueue_burst`,ring 只被打一次 |
 | 无锁 | sketch 为 per-lcore 私有(无共享写);ring 为无锁 DPDK ring:单 RX lcore 时 `RING_F_SP_ENQ\|RING_F_SC_DEQ`,多 RX lcore 时 MP/MC(CAS);统计为 per-lcore 计数器,main lcore 只读聚合 |
@@ -131,7 +132,8 @@ NIC 模式下多 RXQ 依赖网卡 RSS(IP/TCP/UDP)把不同流散到不同队列;
 | `-w, --workers <n>` | worker 数(= ring 数) | 2 |
 | `-t, --threshold <bytes>` | 大象流字节阈值 | 1 MiB |
 | `-s, --synthetic` | 软件合成流量(无需网卡) | off |
-| `-i, --stats-period <s>` | 统计打印间隔(秒) | 2 |
+| `-W, --time-window` | **时间窗口型判定**(双 sketch 轮转,见下文) | off |
+| `-i, --stats-period <s>` | 统计打印间隔(秒)。`-W` 模式下同时作为窗口长度 | 2 |
 
 EAL 参数(`-l`、`-n`、`-a` 等)与 DPDK 标准用法一致,`--` 之后是应用参数。
 

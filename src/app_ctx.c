@@ -9,11 +9,11 @@
 #include "elephant_common.h"
 
 volatile int g_force_quit = 0;
+volatile uint32_t g_epoch = 0;
 
 int elephant_dynfield_offset = -1;
 
-int
-elephant_dynfield_init(void)
+int elephant_dynfield_init(void)
 {
 	static const struct rte_mbuf_dynfield meta_desc = {
 		.name = "elephantdpdk_flow_meta",
@@ -21,8 +21,7 @@ elephant_dynfield_init(void)
 		.align = __alignof__(uint64_t),
 	};
 
-	elephant_dynfield_offset =
-		rte_mbuf_dynfield_register(&meta_desc);
+	elephant_dynfield_offset = rte_mbuf_dynfield_register(&meta_desc);
 	if (elephant_dynfield_offset < 0) {
 		RTE_LOG(ERR, EDPDK,
 			"failed to register mbuf dynfield: %s\n",
@@ -48,5 +47,7 @@ app_config_init_defaults(struct app_config *cfg)
 	cfg->n_workers = 2;
 	cfg->elephant_threshold = ELEPHANT_DEFAULT_THRESHOLD;
 	cfg->synthetic = false;
+	cfg->time_window = false;
+	cfg->time_window_s = 10;
 	cfg->stats_period_s = 2;
 }

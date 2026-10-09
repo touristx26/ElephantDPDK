@@ -75,10 +75,15 @@ print_usage(const char *prog)
 {
 	printf("Usage: %s [EAL options] -- [app options]\n"
 	       "App options:\n"
-	       "  -p, --port <id>        NIC port id (default 0)\n"
+	       "  -p, --port <id>         NIC port id (default 0)\n"
 	       "  -q, --rx-queues <n>    number of RX queues / RX lcores (default 1)\n"
 	       "  -w, --workers <n>      number of workers (default 2)\n"
 	       "  -t, --threshold <b>    per-flow elephant threshold in bytes (default 1MiB)\n"
+	       "  -W, --time-window <s>  sliding-window size in seconds (default 2).\n"
+	       "                         Each window spans TWO rotation intervals\n"
+	       "                         (current sketch + previous sketch), so the\n"
+	       "                         rotation interval is s/2 and the window slides\n"
+	       "                         every s/2 seconds.\n"
 	       "  -s, --synthetic        software traffic generator, no NIC needed\n"
 	       "  -i, --stats-period <s> stats print interval in seconds (default 2)\n"
 	       "  -h, --help             show this help\n",
@@ -93,6 +98,7 @@ parse_app_args(int argc, char **argv, struct app_config *cfg)
 		{"rx-queues",    required_argument, NULL, 'q'},
 		{"workers",      required_argument, NULL, 'w'},
 		{"threshold",    required_argument, NULL, 't'},
+		{"time-window",  required_argument, NULL, 'W'},
 		{"synthetic",    no_argument,       NULL, 's'},
 		{"stats-period", required_argument, NULL, 'i'},
 		{"help",         no_argument,       NULL, 'h'},
@@ -102,7 +108,7 @@ parse_app_args(int argc, char **argv, struct app_config *cfg)
 	const char *prog = (argc > 0 && argv[0] != NULL) ? argv[0]
 							 : "elephantdpdk";
 
-	while ((opt = getopt_long(argc, argv, "p:q:w:t:si:h", longopts,
+	while ((opt = getopt_long(argc, argv, "p:q:w:t:W:si:h", longopts,
 				   NULL)) != -1) {
 		long v;
 
@@ -139,6 +145,18 @@ parse_app_args(int argc, char **argv, struct app_config *cfg)
 			break;
 		case 's':
 			cfg->synthetic = true;
+			break;
+		case 'W':
+			v = atol(optarg);
+			if (v < 2) {
+				fprintf(stderr,
+					"invalid time-window (must be >= 2s, "
+					"covers current+previous rotation): %s\n",
+					optarg);
+				return -1;
+			}
+			cfg->time_window = true;
+			cfg->time_window_s = (unsigned)v;
 			break;
 		case 'i':
 			v = atol(optarg);
@@ -340,6 +358,10 @@ main(int argc, char *argv[])
 		"threshold=%" PRIu64 " bytes\n",
 		cfg.synthetic ? "synthetic" : "NIC", cfg.n_rx_queues,
 		cfg.n_workers, cfg.elephant_threshold);
+	if (cfg.time_window)
+		RTE_LOG(INFO, EDPDK, "time-window mode: %u s window, "
+			"rotation every %u s\n",
+			cfg.time_window_s, cfg.time_window_s / 2);
 
 	/* Assign lcore roles: main + n_rx_queues RX lcores + n_workers. */
 	unsigned int n_rx = 0, n_wk = 0;
@@ -433,6 +455,10 @@ main(int argc, char *argv[])
 
 		uint64_t now = rte_rdtsc();
 		double dt = (double)(now - last_tsc) / (double)tsc_hz;
+
+		/* Broadcast window rotation to all RX lcores. */
+		if (cfg.time_window)
+			app_epoch_bump();
 
 		print_stats(rx_ctxs, cfg.n_rx_queues, disp, workers,
 			    cfg.n_workers, dt, &prev_rx_pkts);

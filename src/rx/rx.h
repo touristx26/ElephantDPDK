@@ -25,45 +25,40 @@
 #include "nitrosketch/nitrosketch.h"
 #include "dispatcher/dispatcher.h"
 
-/* Direct-mapped table to avoid re-announcing the same elephant flow. */
-#define RX_ANNOUNCE_TABLE 256u
-
-struct elephant_rx_stats {
-	uint64_t packets;
-	uint64_t bytes;
-	uint64_t elephant_packets;
-	uint64_t elephant_flows;   /* distinct flows announced at least once */
-} __rte_cache_aligned;
-
+/*
+ * Time-window mode: dual-sketch rotation.
+ * Each RX lcore owns two sketches, [epoch & 1] is the current
+ * (active, write) sketch; the other is the retired snapshot (read-only)
+ * of the previous window. The main lcore periodically increments a
+ * global epoch (broadcast via atomic add), and each RX lcore observes
+ * the epoch change at burst granularity: it clears the retired sketch
+ * and swaps roles. Estimation reads the CURRENT sketch (cumulative-so-far
+ * within the window). A slow trickle (keepalive-like) flow never
+ * accumulates enough bytes within a single window to be declared elephant.
+ */
 struct elephant_rx_ctx {
-	/* configuration (read-only after init) */
 	uint16_t port_id;
 	uint16_t queue_id;
 	uint64_t elephant_threshold;
 	bool synthetic;
+	bool time_window;
+	uint32_t lcore_epoch;       /* last observed global epoch         */
 	struct rte_mempool *pool;
 	struct elephant_dispatcher *disp;
+	struct nitrosketch sketch[2];  /* [0]=current, [1]=retired (rotated) */
 
-	/* per-lcore state (no sharing => no locks) */
-	struct nitrosketch sketch;
-	uint64_t lcg;              /* synthetic-mode RNG state */
-	uint64_t announced[RX_ANNOUNCE_TABLE];
+	uint64_t lcg;
+	uint64_t announced[256];
 
-	/* statistics (written by this lcore, read by main) */
 	struct elephant_rx_stats stats;
 };
 
-/**
- * Initialize an RX context (including its private sketch).
- * @seed should be unique per lcore.
- */
 int elephant_rx_ctx_init(struct elephant_rx_ctx *ctx,
 			 const struct app_config *cfg,
 			 uint16_t port_id, uint16_t queue_id,
 			 struct rte_mempool *pool,
 			 struct elephant_dispatcher *disp,
 			 uint64_t seed);
-
 void elephant_rx_ctx_free(struct elephant_rx_ctx *ctx);
 
 /** RX lcore main loop (run via rte_eal_remote_launch). */

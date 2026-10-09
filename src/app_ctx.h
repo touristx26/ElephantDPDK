@@ -13,12 +13,14 @@
 #include <stdbool.h>
 
 struct app_config {
-	uint16_t port_id;         /* NIC port used in real-NIC mode      */
-	uint16_t n_rx_queues;      /* number of RX queues (and RX lcores) */
-	uint16_t n_workers;        /* number of worker rings/lcores       */
-	uint64_t elephant_threshold; /* per-flow bytes before elephant   */
-	bool synthetic;            /* generate flows in software (no NIC) */
-	unsigned stats_period_s;  /* stats print interval, main lcore    */
+	uint16_t port_id;             /* NIC port used in real-NIC mode      */
+	uint16_t n_rx_queues;         /* number of RX queues (and RX lcores) */
+	uint16_t n_workers;           /* number of worker rings/lcores       */
+	uint64_t elephant_threshold; /* per-flow bytes before elephant      */
+	bool synthetic;               /* generate flows in software (no NIC) */
+	bool time_window;             /* dual-sketch rotation, windowed mode */
+	unsigned time_window_s;       /* time window size in seconds         */
+	unsigned stats_period_s;      /* stats print interval, main lcore    */
 };
 
 /* Set in app_ctx.c, written by the signal handler / main lcore. */
@@ -31,6 +33,23 @@ app_force_quit(void)
 }
 
 void app_force_quit_set(void);
+
+/* Global window rotation epoch: incremented by the main lcore every
+ * time_window_s/2 seconds, observed by each RX lcore at burst
+ * granularity to swap dual-sketch roles. */
+extern volatile uint32_t g_epoch;
+
+static inline uint32_t
+app_epoch(void)
+{
+	return __atomic_load_n(&g_epoch, __ATOMIC_RELAXED);
+}
+
+static inline void
+app_epoch_bump(void)
+{
+	__atomic_add_fetch(&g_epoch, 1, __ATOMIC_RELAXED);
+}
 
 /* Fill config with defaults. */
 void app_config_init_defaults(struct app_config *cfg);

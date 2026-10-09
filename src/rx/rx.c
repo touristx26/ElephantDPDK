@@ -214,9 +214,27 @@ rx_announce_elephant(struct elephant_rx_ctx *ctx, uint64_t flow_hash,
 	return true;
 }
 
+static inline void
+ns_clear(struct nitrosketch *ns)
+{
+	if (ns->counters)
+		memset(ns->counters, 0,
+		       (size_t)ns->rows * ns->cols * sizeof(uint64_t));
+}
+
 /*
- * Core per-burst pipeline:
- *   key/hash -> NitroSketch -> elephant flag (dynfield) -> dispatcher
+ * Core per-burst pipeline (fast path):
+ *
+ *   rx_extract_flow -> elephant_flow_hash
+ *     -> ns_update (dual: current + previous window)
+ *     -> sliding-window estimate >= threshold ?
+ *     -> elephant_mbuf_mark(m, h, is_elephant)
+ *     -> elephant_dispatch_burst
+ *
+ * In time-window mode a window spans [-W, 0] seconds: the previous
+ * window sketch carries full history, the current sketch accumulates
+ * bytes received so far. A flow is elephant when the sliding-window
+ * estimate reaches the threshold.
  */
 static inline void
 rx_process_burst(struct elephant_rx_ctx *ctx,
@@ -224,6 +242,8 @@ rx_process_burst(struct elephant_rx_ctx *ctx,
 {
 	uint64_t bytes = 0;
 	uint64_t elephant_pkts = 0;
+	const uint32_t cur_idx = ctx->lcore_epoch & 1;
+	const uint32_t prev_idx = cur_idx ^ 1;
 
 	for (uint16_t i = 0; i < n; i++) {
 		struct rte_mbuf *m = pkts[i];
@@ -233,10 +253,21 @@ rx_process_burst(struct elephant_rx_ctx *ctx,
 
 		if (rx_extract_flow(m, &key)) {
 			h = elephant_flow_hash(&key);
-			ns_update(&ctx->sketch, h, m->pkt_len);
-			uint64_t est = ns_estimate(&ctx->sketch, h);
 
-			is_elephant = est >= ctx->elephant_threshold;
+			if (ctx->time_window) {
+				/* Sliding window: [prev window full] + [current so far] */
+				ns_update(&ctx->sketch[cur_idx], h, m->pkt_len);
+				uint64_t cur_est = ns_estimate(&ctx->sketch[cur_idx], h);
+				uint64_t prev_est = ns_estimate(&ctx->sketch[prev_idx], h);
+				is_elephant =
+					(cur_est + prev_est) >= ctx->elephant_threshold;
+			} else {
+				ns_update(&ctx->sketch[cur_idx], h, m->pkt_len);
+				is_elephant =
+					ns_estimate(&ctx->sketch[cur_idx], h) >=
+					ctx->elephant_threshold;
+			}
+
 			if (is_elephant) {
 				elephant_pkts++;
 				rx_announce_elephant(ctx, h, est);
@@ -301,13 +332,21 @@ elephant_rx_ctx_init(struct elephant_rx_ctx *ctx,
 	ctx->queue_id = queue_id;
 	ctx->elephant_threshold = cfg->elephant_threshold;
 	ctx->synthetic = cfg->synthetic;
+	ctx->time_window = cfg->time_window;
 	ctx->pool = pool;
 	ctx->disp = disp;
 	ctx->lcg = seed ^ 0xd1b54a32d192ed03ULL;
 
-	if (ns_init(&ctx->sketch, NS_DEFAULT_ROWS, NS_DEFAULT_COLS,
+	if (ns_init(&ctx->sketch[0], NS_DEFAULT_ROWS, NS_DEFAULT_COLS,
 		    NS_DEFAULT_RATE, seed) < 0)
 		return -1;
+
+	if (cfg->time_window &&
+	    ns_init(&ctx->sketch[1], NS_DEFAULT_ROWS, NS_DEFAULT_COLS,
+		    NS_DEFAULT_RATE, seed + 1) < 0) {
+		ns_free(&ctx->sketch[0]);
+		return -1;
+	}
 	return 0;
 }
 
@@ -316,5 +355,7 @@ elephant_rx_ctx_free(struct elephant_rx_ctx *ctx)
 {
 	if (ctx == NULL)
 		return;
-	ns_free(&ctx->sketch);
+	if (ctx->time_window)
+		ns_free(&ctx->sketch[1]);
+	ns_free(&ctx->sketch[0]);
 }
