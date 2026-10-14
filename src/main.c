@@ -333,9 +333,8 @@ port_init(uint16_t port, uint16_t n_rx_queues, struct rte_mempool *pool)
 
 static void
 print_run_status(struct ringmon *mons, uint16_t n_rings,
-		 struct elephant_worker *workers,
 		 struct elephant_rx_ctx *rx_ctxs, uint16_t n_rx,
-		 double dt_s, uint64_t *last_wpkts, uint64_t *last_rxpkts)
+		 double dt_s, uint64_t *last_rxpkts)
 {
 	uint64_t rx_pkts = 0;
 
@@ -350,11 +349,6 @@ print_run_status(struct ringmon *mons, uint16_t n_rings,
 	printf("---- gen %.2f Mpps | ", gen_mpps);
 	for (uint16_t w = 0; w < n_rings; w++) {
 		const struct ringmon_metrics *m = &mons[w].metrics;
-		uint64_t wpkts = workers[w].stats.packets;
-		double w_mpps = dt_s > 0.0 ?
-			(double)(wpkts - last_wpkts[w]) / dt_s / 1e6 : 0.0;
-
-		last_wpkts[w] = wpkts;
 
 		printf("ring%u[%u%% arr%.2fM svc%.2fM grow%+.2fM%s]%s",
 		       w, m->depth_pct,
@@ -560,7 +554,6 @@ main(int argc, char *argv[])
 	uint64_t tsc_hz = rte_get_tsc_hz();
 	uint64_t stats_ticks = (uint64_t)cfg.stats_period_s * tsc_hz;
 	uint64_t next_stats = rte_rdtsc() + stats_ticks;
-	uint64_t last_wpkts[ELEPHANT_MAX_WORKERS] = {0};
 	uint64_t last_rxpkts = 0;
 
 	while (!app_force_quit()) {
@@ -568,10 +561,10 @@ main(int argc, char *argv[])
 
 		if (now >= next_stats) {
 			next_stats = now + stats_ticks;
-			print_run_status(mons, cfg.n_workers, workers,
+			print_run_status(mons, cfg.n_workers,
 					 rx_ctxs, cfg.n_rx_queues,
 					 (double)stats_ticks / (double)tsc_hz,
-					 last_wpkts, &last_rxpkts);
+					 &last_rxpkts);
 		}
 
 		rte_delay_us_sleep(500);

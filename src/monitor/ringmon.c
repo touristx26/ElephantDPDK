@@ -278,7 +278,7 @@ ringmon_finish_trial(struct ringmon *mon, uint64_t now)
 			       n_near[a] > 0 ? mae_near[a] / n_near[a] : -1.0,
 			       bias[a] / n[a], first_lead[a]);
 		else
-			printf(" %s[n=0]", ringmon_algo_name(a);
+			printf(" %s[n=0]", ringmon_algo_name(a));
 	}
 	printf("\n");
 	fflush(stdout);
