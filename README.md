@@ -1,6 +1,6 @@
 # ElephantDPDK —— QLF 分支(feature/qlf)
 
-**Ring 打满时间(TTF, time-to-full)预测实验框架**。本分支不再做大象流检测,而是研究:DPDK pipeline 中 `dispatcher -> worker` 的 rte_ring 何时会被打爆,并在**受控实验场景**下对比多种预测算法的性能。
+**Ring 打满时间(TTF, time-to-full)预测实验框架**。本分支研究:DPDK pipeline 中 `dispatcher -> worker` 的 rte_ring 何时会被打爆,并在**受控实验场景**下对比多种预测算法的性能。
 
 > 大象流检测版本(NitroSketch + 时间窗口)在 `main` 分支。
 
@@ -91,22 +91,57 @@ sudo ./build/elephantdpdk -l 0-4 -n 4 --no-pci -- -s
 
 ### 参数说明
 
-| 参数 | 说明 | 默认 |
-|---|---|---|
-| `-q, --rx-queues <n>` | RX 队列数(= RX lcore 数) | 1 |
-| `-w, --workers <n>` | worker 数(= ring 数) | 2 |
-| `-s, --synthetic` | 软件合成流量(无需网卡) | off |
-| `--dpi-us <us>` | worker 每包模拟 DPI 处理时间,决定消费能力 `n_workers/dpi_us` pps | 10 |
-| `--gen-pps <pps>` | 合成流量初始速率(每 RX lcore);0 且无 ramp/sawtooth = 全速压力 | 100000 |
-| `--gen-ramp <pps/s>` | 速率线性爬升 | 10000 |
-| `--gen-sawtooth <s>` | 每 s 秒重置爬升(填充-溢出-排空循环,**单次运行产生多个 trial**) | 0 |
-| `--sample-us <us>` | monitor lcore 采样周期(即 ground truth 的时间量化误差) | 100 |
-| `--pred-window <n>` | depth 序列拟合窗口(采样点数;100us 采样下 512 ≈ 51ms) | 512 |
-| `--csv <path>` | 输出全量数据 CSV(depth、enq/deq、三速率指标、各算法 TTF) | 无 |
-| `-i, --stats-period <s>` | 运行状态行打印间隔 | 2 |
-| `-p, --port <id>` | NIC 端口(NIC 模式) | 0 |
+命令行分两段:`elephantdpdk [EAL 选项] -- [应用选项]`。`-l`/`-n`/`-a`/`--no-pci` 等由 DPDK EAL 解析,`--` 之后才是本实验参数。
 
-> 注意:独立 monitor lcore 占用一个核,总核数 = 1(main) + RX 数 + worker 数 + 1(monitor)。
+lcore 需求:**1(main)+ n_rx + n_workers + 1(monitor)**,独立 monitor lcore 固定占一个核(见"已知限制")。
+
+#### 速查表
+
+| 参数 | 说明 | 取值范围 | 默认 |
+|---|---|---|---|
+| `-q, --rx-queues <n>` | RX 队列数(= RX lcore 数) | 1..8 | 1 |
+| `-w, --workers <n>` | worker 数(= ring 数) | 1..16 | 2 |
+| `-s, --synthetic` | 软件合成流量(无需网卡) | - | off |
+| `--dpi-us <us>` | worker 每包模拟 DPI 忙等 | 0..10000 | 10 |
+| `--gen-pps <pps>` | 合成流量初始速率(每 RX lcore) | ≥0 | 100000 |
+| `--gen-ramp <pps/s>` | 速率线性爬升斜率 | ≥0 | 10000 |
+| `--gen-sawtooth <s>` | 周期重置爬升,产生多个 trial | ≥0 | 0 |
+| `--sample-us <us>` | monitor 采样周期 | 1..1000000 | 100 |
+| `--pred-window <n>` | depth 序列拟合窗口(采样数) | 4..16384 | 512 |
+| `--csv <path>` | 全量数据 CSV 输出 | - | 无 |
+| `-i, --stats-period <s>` | 运行状态行打印间隔(秒) | ≥1 | 2 |
+| `-p, --port <id>` | NIC 端口(NIC 模式) | - | 0 |
+
+#### 生产侧(合成流量模型)
+
+- **`-s, --synthetic`**:启用软件令牌桶流量发生器,无需网卡(配合 `--no-pci`)。每 RX lcore 一个独立发生器,速率模型 `rate(t) = gen_pps + gen_ramp × elapsed`;流亲和保留,流量由 64 条合成流构成(4 条 1400B 重流 / 12 条 512B 中流 / 48 条 64B 鼠流,按 25%/25%/50% 加权混发)。不开启此模式则必须配置真实 NIC 端口。
+
+- **`--gen-pps <pps>`**:每 RX lcore 的初始速率(令牌/秒),总生产速率 = `gen_pps × n_rx`。设为 `0` 且无 ramp/sawtooth 时为**全速压力模式**,速率仅受 mempool 分配上限约束。起点若已高于总消费能力,ring 从一开始就持续填充。
+
+- **`--gen-ramp <pps/s>`**:速率随时间线性爬升。**穿越消费能力的时刻** `t_cross = (总消费能力 − gen_pps) / gen_ramp`,其中总消费能力 ≈ `n_workers / dpi_us` pps。想控制"多少秒后开始涨满",主要调它。
+
+- **`--gen-sawtooth <s>`**:每 s 秒将 elapsed 清零,速率回落到 gen_pps 重新爬升,形成"填充 → 溢出 → 速率回落 → 排空 → 再填充"循环,**单次运行产生多个 trial**,统计更稳。`0` = 单调爬升,溢出后持续过载,不再产生新 trial。
+
+- **`-q, --rx-queues <n>`**:RX 队列数,每队列绑一个 RX lcore。>1 时 dispatcher ring 从 SP/SC 退化为 MP/MC(仍无锁,但略慢);NIC 模式还要求端口支持 RSS,synthetic 模式下总生产速率随队列数线性放大。
+
+#### 消费侧(worker)
+
+- **`--dpi-us <us>`**:worker 每包的确定性忙等微秒数(外加一次 payload memchr 扫描)。单 worker 消费能力 ≈ `1/dpi_us` pps,**总消费能力 ≈ `n_workers / dpi_us`**(默认 2/10µs = 200K pps)。`0` = 只扫描不忙等,消费能力由访存决定(极高)。它与 `--gen-pps/--gen-ramp` 构成受控实验的生产/消费两端。
+
+- **`-w, --workers <n>`**:worker 数,每 worker 一条独立 4096 深的 ring,flow hash 保证同流同 worker(2 的幂用位掩码分发,否则取模)。**每条 ring 独立检测溢出、独立结算 trial**,worker 数即 trial 并行度。
+
+#### 监视与预测(monitor lcore)
+
+- **`--sample-us <us>`**:monitor 的采样周期(TSC 忙等保证精确边界)。同时决定三件事:① ground truth 的时间量化误差 ≤ 一个周期;② `rate` 算法的差分窗口(越小响应越快、越噪);③ 历史/预测日志的覆盖时长 = `16384 × sample_us`(100µs ≈ 1.6s,1ms ≈ 16.4s)。放大采样周期前先确认 trial 的填充时长仍在覆盖范围内。无论周期多大,monitor 均忙等占满一个核。
+
+- **`--pred-window <n>`**:linreg/ewma/holt 的拟合窗口(采样点数),100µs 采样下 512 ≈ 51ms。窗口大 → 平滑强、对趋势变化响应慢;窗口小 → 噪声敏感。`rate` 算法不受此参数影响(它只用当前一个周期的计数器差分)。
+
+- **`--csv <path>`**:每采样周期每 ring 写一行:`t_ms, ring, depth, depth_pct, enq_pkts, deq_pkts(累计计数器), arrival_pps, service_pps, growth_pps, ttf_rate, ttf_linreg, ttf_ewma, ttf_holt`(无有效预测时对应 TTF 记 -1)。由 monitor lcore 直接写入,glibc FILE 内部锁保证线程安全。
+
+#### 其他
+
+- **`-i, --stats-period <s>`**:main lcore 运行状态行的打印间隔(秒),只影响显示,不影响实验与测量。
+- **`-p, --port <id>`**:NIC 模式端口 id;promiscuous 强制开启,RSS offload 按端口实际支持项过滤。
 
 ### 典型实验场景
 
