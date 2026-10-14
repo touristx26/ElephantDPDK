@@ -2,11 +2,13 @@
  * Copyright (c) 2026 ElephantDPDK contributors */
 
 #include <inttypes.h>
+#include <math.h>
 #include <string.h>
 #include <netinet/in.h>
 
 #include <rte_byteorder.h>
 #include <rte_common.h>
+#include <rte_cycles.h>
 #include <rte_ether.h>
 #include <rte_ethdev.h>
 #include <rte_ip.h>
@@ -18,11 +20,11 @@
 #include "rx.h"
 #include "app_ctx.h"
 
-/* ---------- Synthetic traffic (demo mode without a NIC) ---------- */
+/* ---------- 合成流量(无 NIC 的实验模式) ---------- */
 
-#define SYNTH_HEAVY_FLOWS  4     /* flows 0..3: 1400-byte packets   */
-#define SYNTH_MED_FLOWS    12    /* flows 4..15: 512-byte packets   */
-#define SYNTH_TOTAL_FLOWS  64    /* flows 16..63: 64-byte packets   */
+#define SYNTH_HEAVY_FLOWS  4     /* 流 0..3: 1400 字节包   */
+#define SYNTH_MED_FLOWS    12    /* 流 4..15: 512 字节包   */
+#define SYNTH_TOTAL_FLOWS  64    /* 流 16..63: 64 字节包   */
 
 struct synth_pkt_spec {
 	uint16_t len;
@@ -36,7 +38,7 @@ lcg_next(uint64_t *s)
 	return *s;
 }
 
-/* Weighted flow selection: 25% heavy, 25% medium, 50% mice. */
+/* 加权选流: 25% 重流 / 25% 中流 / 50% 鼠流 */
 static inline struct synth_pkt_spec
 synth_next_flow(struct elephant_rx_ctx *ctx)
 {
@@ -64,16 +66,14 @@ synth_next_flow(struct elephant_rx_ctx *ctx)
 	return spec;
 }
 
-/*
- * Build one synthetic packet in the mbuf's data area. Only the headers
- * needed by flow extraction are filled in.
- */
+/* 在 mbuf 数据区构造一个合成包(只填流提取所需的头部) */
 static uint16_t
-synth_generate_burst(struct elephant_rx_ctx *ctx, struct rte_mbuf **pkts)
+synth_generate_burst(struct elephant_rx_ctx *ctx, struct rte_mbuf **pkts,
+		     uint16_t max)
 {
 	uint16_t n = 0;
 
-	for (uint16_t i = 0; i < ELEPHANT_BURST_MAX; i++) {
+	for (uint16_t i = 0; i < max; i++) {
 		struct synth_pkt_spec spec = synth_next_flow(ctx);
 		struct rte_mbuf *m = rte_pktmbuf_alloc(ctx->pool);
 
@@ -90,7 +90,7 @@ synth_generate_burst(struct elephant_rx_ctx *ctx, struct rte_mbuf **pkts)
 		eth->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
 		memset(ip, 0, sizeof(*ip));
-		ip->version_ihl = 0x45; /* IPv4, IHL = 5 (20 bytes) */
+		ip->version_ihl = 0x45; /* IPv4, IHL = 5 (20 字节) */
 		ip->total_length = rte_cpu_to_be_16(spec.len -
 						    sizeof(*eth));
 		ip->next_proto_id = IPPROTO_UDP;
@@ -106,7 +106,7 @@ synth_generate_burst(struct elephant_rx_ctx *ctx, struct rte_mbuf **pkts)
 		udp->dst_port = rte_cpu_to_be_16(80);
 		udp->dgram_len = rte_cpu_to_be_16((uint16_t)(spec.len -
 				sizeof(*eth) - sizeof(*ip)));
-		udp->dgram_cksum = 0; /* not validated by the pipeline */
+		udp->dgram_cksum = 0; /* 管线不校验 */
 
 		m->port = ctx->port_id;
 		m->pkt_len = spec.len;
@@ -116,11 +116,45 @@ synth_generate_burst(struct elephant_rx_ctx *ctx, struct rte_mbuf **pkts)
 	return n;
 }
 
-/* ---------- Flow key extraction (fast path) ---------- */
+/*
+ * 令牌桶: 按当前瞬时速率累积令牌, 返回本次允许生成的包数。
+ * 全速模式(rate_control == false)直接放行整个 burst。
+ */
+static uint32_t
+synth_tokens_available(struct elephant_rx_ctx *ctx)
+{
+	if (!ctx->rate_control)
+		return ELEPHANT_BURST_MAX;
+
+	uint64_t tsc_hz = rte_get_tsc_hz();
+	uint64_t now = rte_rdtsc();
+	double dt_s = (double)(now - ctx->gen_last_tsc) / (double)tsc_hz;
+
+	ctx->gen_last_tsc = now;
+
+	double rate = (double)ctx->gen_pps;
+	if (ctx->gen_ramp > 0 || ctx->gen_sawtooth_s > 0) {
+		double elapsed = (double)(now - ctx->start_tsc) /
+				 (double)tsc_hz;
+
+		if (ctx->gen_sawtooth_s > 0)
+			elapsed = fmod(elapsed, (double)ctx->gen_sawtooth_s);
+		rate += (double)ctx->gen_ramp * elapsed;
+	}
+
+	ctx->gen_tokens += rate * dt_s;
+	/* 突发上限: 空闲后不会一次性补发过多 */
+	if (ctx->gen_tokens > (double)ELEPHANT_BURST_MAX * 2.0)
+		ctx->gen_tokens = (double)ELEPHANT_BURST_MAX * 2.0;
+
+	return (uint32_t)ctx->gen_tokens;
+}
+
+/* ---------- Flow Key 提取(fast path, 仅供分发亲和) ---------- */
 
 /*
- * Extract a normalized flow key from the packet headers.
- * Returns false for non-IP traffic (still dispatched, but untracked).
+ * 从包头提取归一化的流键。返回 false 表示非 IP 流量
+ * (仍会往下分发, 只是哈希退化为 mbuf 指针哈希)。
  */
 static bool
 rx_extract_flow(const struct rte_mbuf *m, struct elephant_flow_key *key)
@@ -162,8 +196,7 @@ rx_extract_flow(const struct rte_mbuf *m, struct elephant_flow_key *key)
 		if (ihl < sizeof(*ip) || m->data_len < offset + ihl)
 			return false;
 
-		/* memcpy: L3 sits at a 14-byte offset, not necessarily
-		 * 4-byte aligned. */
+		/* memcpy: L3 头偏移 14 字节, 未必 4 字节对齐 */
 		memcpy(&key->src_ip[0], &ip->src_addr, sizeof(uint32_t));
 		memcpy(&key->dst_ip[0], &ip->dst_addr, sizeof(uint32_t));
 		proto = ip->next_proto_id;
@@ -182,7 +215,7 @@ rx_extract_flow(const struct rte_mbuf *m, struct elephant_flow_key *key)
 		proto = ip6->proto;
 		l4 = (const uint8_t *)ip6 + sizeof(*ip6);
 	} else {
-		return false; /* non-IP: forwarded, untracked */
+		return false;
 	}
 
 	key->proto = (uint8_t)proto;
@@ -195,88 +228,27 @@ rx_extract_flow(const struct rte_mbuf *m, struct elephant_flow_key *key)
 	return true;
 }
 
-/* Announce a flow the first time it crosses the elephant threshold. */
-static bool
-rx_announce_elephant(struct elephant_rx_ctx *ctx, uint64_t flow_hash,
-		     uint64_t est)
-{
-	uint32_t i = flow_hash & (RX_ANNOUNCE_TABLE - 1);
-
-	if (ctx->announced[i] == flow_hash)
-		return false;
-
-	ctx->announced[i] = flow_hash;
-	ctx->stats.elephant_flows++;
-	RTE_LOG(INFO, EDPDK,
-		"rx q%u: ELEPHANT flow hash=0x%012" PRIx64
-		" est=%" PRIu64 " bytes (threshold=%" PRIu64 ")\n",
-		ctx->queue_id, flow_hash, est, ctx->elephant_threshold);
-	return true;
-}
-
-static inline void
-ns_clear(struct nitrosketch *ns)
-{
-	if (ns->counters)
-		memset(ns->counters, 0,
-		       (size_t)ns->rows * ns->cols * sizeof(uint64_t));
-}
-
 /*
- * Core per-burst pipeline (fast path):
- *
- *   rx_extract_flow -> elephant_flow_hash
- *     -> ns_update (dual: current + previous window)
- *     -> sliding-window estimate >= threshold ?
- *     -> elephant_mbuf_mark(m, h, is_elephant)
- *     -> elephant_dispatch_burst
- *
- * In time-window mode a window spans [-W, 0] seconds: the previous
- * window sketch carries full history, the current sketch accumulates
- * bytes received so far. A flow is elephant when the sliding-window
- * estimate reaches the threshold.
+ * 每个 burst 的核心处理:
+ *   flow 提取/哈希 -> mbuf 打标(仅哈希) -> dispatcher 分发
  */
 static inline void
 rx_process_burst(struct elephant_rx_ctx *ctx,
 		 struct rte_mbuf **pkts, uint16_t n)
 {
 	uint64_t bytes = 0;
-	uint64_t elephant_pkts = 0;
-	const uint32_t cur_idx = ctx->lcore_epoch & 1;
-	const uint32_t prev_idx = cur_idx ^ 1;
 
 	for (uint16_t i = 0; i < n; i++) {
 		struct rte_mbuf *m = pkts[i];
 		struct elephant_flow_key key;
 		uint64_t h;
-		bool is_elephant = false;
 
-		if (rx_extract_flow(m, &key)) {
+		if (rx_extract_flow(m, &key))
 			h = elephant_flow_hash(&key);
-
-			if (ctx->time_window) {
-				/* Sliding window: [prev window full] + [current so far] */
-				ns_update(&ctx->sketch[cur_idx], h, m->pkt_len);
-				uint64_t cur_est = ns_estimate(&ctx->sketch[cur_idx], h);
-				uint64_t prev_est = ns_estimate(&ctx->sketch[prev_idx], h);
-				uint64_t est = cur_est + prev_est;
-				is_elephant = est >= ctx->elephant_threshold;
-			} else {
-				ns_update(&ctx->sketch[cur_idx], h, m->pkt_len);
-				uint64_t est = ns_estimate(&ctx->sketch[cur_idx], h);
-				is_elephant = est >= ctx->elephant_threshold;
-
-				if (is_elephant) {
-					elephant_pkts++;
-					rx_announce_elephant(ctx, h, est);
-				}
-			}
-		} else {
-			/* Non-IP: spread by a per-packet hash, no flag. */
+		else
 			h = elephant_fmix64((uint64_t)(uintptr_t)m);
-		}
 
-		elephant_mbuf_mark(m, h, is_elephant);
+		elephant_mbuf_mark(m, h, false);
 		bytes += m->pkt_len;
 	}
 
@@ -284,7 +256,6 @@ rx_process_burst(struct elephant_rx_ctx *ctx,
 
 	ctx->stats.packets += n;
 	ctx->stats.bytes += bytes;
-	ctx->stats.elephant_packets += elephant_pkts;
 }
 
 int
@@ -301,13 +272,20 @@ elephant_rx_lcore_main(void *arg)
 		ctx->disp->n_rings);
 
 	while (likely(!app_force_quit())) {
-		uint16_t n;
+		uint16_t n = 0;
 
-		if (ctx->synthetic)
-			n = synth_generate_burst(ctx, pkts);
-		else
+		if (ctx->synthetic) {
+			uint32_t allowed = synth_tokens_available(ctx);
+
+			if (allowed > 0) {
+				n = synth_generate_burst(ctx, pkts,
+							 (uint16_t)allowed);
+				ctx->gen_tokens -= n;
+			}
+		} else {
 			n = rte_eth_rx_burst(ctx->port_id, ctx->queue_id,
 					     pkts, ELEPHANT_BURST_MAX);
+		}
 		if (unlikely(n == 0))
 			continue;
 		rx_process_burst(ctx, pkts, n);
@@ -329,32 +307,18 @@ elephant_rx_ctx_init(struct elephant_rx_ctx *ctx,
 	memset(ctx, 0, sizeof(*ctx));
 	ctx->port_id = port_id;
 	ctx->queue_id = queue_id;
-	ctx->elephant_threshold = cfg->elephant_threshold;
 	ctx->synthetic = cfg->synthetic;
-	ctx->time_window = cfg->time_window;
 	ctx->pool = pool;
 	ctx->disp = disp;
 	ctx->lcg = seed ^ 0xd1b54a32d192ed03ULL;
 
-	if (ns_init(&ctx->sketch[0], NS_DEFAULT_ROWS, NS_DEFAULT_COLS,
-		    NS_DEFAULT_RATE, seed) < 0)
-		return -1;
-
-	if (cfg->time_window &&
-	    ns_init(&ctx->sketch[1], NS_DEFAULT_ROWS, NS_DEFAULT_COLS,
-		    NS_DEFAULT_RATE, seed + 1) < 0) {
-		ns_free(&ctx->sketch[0]);
-		return -1;
-	}
+	ctx->gen_pps = cfg->gen_pps;
+	ctx->gen_ramp = cfg->gen_ramp;
+	ctx->gen_sawtooth_s = cfg->gen_sawtooth_s;
+	ctx->rate_control = cfg->gen_pps > 0 || cfg->gen_ramp > 0 ||
+			    cfg->gen_sawtooth_s > 0;
+	ctx->start_tsc = rte_rdtsc();
+	ctx->gen_last_tsc = ctx->start_tsc;
+	ctx->gen_tokens = ELEPHANT_BURST_MAX; /* 开局快速填充管道 */
 	return 0;
-}
-
-void
-elephant_rx_ctx_free(struct elephant_rx_ctx *ctx)
-{
-	if (ctx == NULL)
-		return;
-	if (ctx->time_window)
-		ns_free(&ctx->sketch[1]);
-	ns_free(&ctx->sketch[0]);
 }

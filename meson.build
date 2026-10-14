@@ -27,16 +27,17 @@ if not dpdk_dep.found()
     dpdk_dep = dependency('dpdk', method: 'pkg-config')
 endif
 
-# libm for pow() in the NitroSketch seeding code.
+# libm for fmod()/fabs() in the load generator and predictors.
 m_dep = cc.find_library('m', required: false)
 
 sources = files(
     'src/main.c',
     'src/app_ctx.c',
     'src/rx/rx.c',
-    'src/nitrosketch/nitrosketch.c',
     'src/dispatcher/dispatcher.c',
     'src/worker/worker.c',
+    'src/monitor/ringmon.c',
+    'src/predict/predict.c',
 )
 
 inc = include_directories('src')

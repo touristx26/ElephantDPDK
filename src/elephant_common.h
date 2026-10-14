@@ -37,7 +37,8 @@ extern int edpdk_logtype;
 #define ELEPHANT_MAX_WORKERS      16
 #define ELEPHANT_MAX_RX_QUEUES    8
 #define ELEPHANT_MEMPOOL_CACHE    256
-#define ELEPHANT_NB_MBUF          8192
+/* ring 全满时最多 2×4096 个 mbuf 滞留队列中, 池容量须留出余量 */
+#define ELEPHANT_NB_MBUF          16384
 #define ELEPHANT_RX_DESC_DEFAULT  1024
 
 /* Default per-flow byte threshold before a flow is declared elephant. */

@@ -23,8 +23,21 @@
 
 #include "elephant_common.h"
 
+/*
+ * Per-ring 单调递增计数器(永不清零):
+ *   enq_pkts: producer 在 enqueue burst 成功后累加(仅成功入队的包)
+ *   deq_pkts: consumer 在 dequeue burst 后累加
+ * 每条独立 cache line, 避免相邻 ring 之间 false sharing。
+ * monitor 线程周期读取快照, 相邻差值即入队/出队速率。
+ */
+struct ring_cntrs {
+	uint64_t enq_pkts;
+	uint64_t deq_pkts;
+} __rte_cache_aligned;
+
 struct elephant_dispatcher {
 	struct rte_ring *rings[ELEPHANT_MAX_WORKERS];
+	struct ring_cntrs *cntrs; /* n_rings 个, per-ring 计数器 */
 	uint32_t n_rings;
 	uint32_t ring_mask;      /* valid only when n_rings is a power of 2 */
 	bool power_of_two;
@@ -89,6 +102,9 @@ elephant_dispatch_burst(struct elephant_dispatcher *d,
 		uint16_t enq = (uint16_t)rte_ring_enqueue_burst(
 			d->rings[w], (void *const *)stage[w], n_staged[w],
 			NULL);
+		if (enq > 0)
+			__atomic_fetch_add(&d->cntrs[w].enq_pkts, enq,
+					   __ATOMIC_RELAXED);
 		if (enq < n_staged[w]) {
 			uint16_t dropped = n_staged[w] - enq;
 			drops += dropped;

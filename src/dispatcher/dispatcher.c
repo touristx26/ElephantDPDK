@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include <rte_log.h>
+#include <rte_malloc.h>
 #include <rte_ring.h>
 
 #include "dispatcher.h"
@@ -23,6 +24,14 @@ elephant_dispatcher_init(struct elephant_dispatcher *d,
 	d->power_of_two = (n_workers & (n_workers - 1)) == 0;
 	if (d->power_of_two)
 		d->ring_mask = n_workers - 1;
+
+	d->cntrs = rte_zmalloc_socket("wk_cntrs",
+				       sizeof(struct ring_cntrs) * n_workers,
+				       RTE_CACHE_LINE_SIZE, socket);
+	if (d->cntrs == NULL) {
+		RTE_LOG(ERR, EDPDK, "failed to allocate ring counters\n");
+		return -1;
+	}
 
 	unsigned flags = 0;
 	if (single_producer)
@@ -56,6 +65,8 @@ elephant_dispatcher_free(struct elephant_dispatcher *d)
 		rte_ring_free(d->rings[w]);
 		d->rings[w] = NULL;
 	}
+	rte_free(d->cntrs);
+	d->cntrs = NULL;
 	d->n_rings = 0;
 }
 
